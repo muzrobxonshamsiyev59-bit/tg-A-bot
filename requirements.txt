@@ -1,0 +1,5 @@
+aiogram>=3.4
+shazamio
+ytmusicapi
+yt-dlp[default]
+audioop-lts; python_version >= "3.13"
