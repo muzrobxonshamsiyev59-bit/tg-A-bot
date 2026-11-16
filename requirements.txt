@@ -1,0 +1,3 @@
+aiogram>=3.4
+shazamio
+yt-dlp

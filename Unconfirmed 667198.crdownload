@@ -1,0 +1,281 @@
+import asyncio
+import logging
+import os
+import shutil
+import tempfile
+from pathlib import Path
+
+from aiogram import Bot, Dispatcher, F
+from aiogram.filters import CommandStart
+from aiogram.types import (
+    CallbackQuery,
+    FSInputFile,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
+from shazamio import Shazam
+from yt_dlp import YoutubeDL
+from yt_dlp.utils import match_filter_func
+
+# ---------- Sozlamalar ----------
+BOT_TOKEN = ""  # yangi tokenni shu yerga qo'ying: "123456789:AAH..."
+if not BOT_TOKEN:
+    raise SystemExit("BOT_TOKEN bo'sh. Kod ichiga tokenni yozing.")
+
+# YouTube "bot emasligingizni tasdiqlang" desa, cookies.txt yo'lini shu yerga yozing:
+#   COOKIES_FILE = "/path/to/cookies.txt"
+COOKIES_FILE = None
+
+MAX_DURATION = 15 * 60                 # 15 daqiqadan uzun treklar yuklanmaydi
+TG_DOWNLOAD_LIMIT = 20 * 1024 * 1024   # Bot API orqali yuklab olish limiti (20 MB)
+TG_UPLOAD_LIMIT = 50 * 1024 * 1024     # Bot API orqali yuborish limiti (50 MB)
+SEARCH_SUFFIX = ""                     # xohlasangiz " audio" qo'shib ko'ring
+MAX_PARALLEL_DOWNLOADS = 3             # bir vaqtda nechta yuklash ishlashi mumkin
+
+logging.basicConfig(level=logging.INFO)
+bot = Bot(BOT_TOKEN)
+dp = Dispatcher()
+
+DOWNLOAD_SEM = asyncio.Semaphore(MAX_PARALLEL_DOWNLOADS)
+ACTIVE_USERS: set[int] = set()  # hozir so'rovi bajarilayotgan foydalanuvchilar
+
+
+def base_ydl_opts() -> dict:
+    opts = {"quiet": True, "noplaylist": True}
+    if COOKIES_FILE and os.path.exists(COOKIES_FILE):
+        opts["cookiefile"] = COOKIES_FILE
+    return opts
+
+
+# ---------- Qidirish va yuklash (yt-dlp) ----------
+def search_sync(query: str, limit: int = 10) -> list[dict]:
+    opts = {**base_ydl_opts(), "extract_flat": True, "skip_download": True}
+    with YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(f"ytsearch{limit}:{query}{SEARCH_SUFFIX}", download=False)
+    if not info:
+        return []
+    return [
+        {"id": e["id"], "title": e.get("title") or "?", "duration": e.get("duration") or 0}
+        for e in info.get("entries", [])
+        if e and e.get("id") and 0 < (e.get("duration") or 0) <= MAX_DURATION
+    ]
+
+
+def download_sync(video_id: str, out_dir: str):
+    opts = {
+        **base_ydl_opts(),
+        "format": "bestaudio/best",
+        "outtmpl": f"{out_dir}/%(id)s.%(ext)s",  # maxsus belgilarsiz xavfsiz nom
+        "match_filter": match_filter_func(f"duration < {MAX_DURATION}"),
+        "postprocessors": [
+            {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}
+        ],
+    }
+    with YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=True)
+    if not info:  # match_filter videoni o'tkazib yuborgan bo'lishi mumkin
+        return None
+    files = list(Path(out_dir).glob("*.mp3"))
+    if not files:
+        return None
+    return files[0], info.get("title"), info.get("uploader"), info.get("duration")
+
+
+def fmt_duration(sec: int) -> str:
+    return f"{sec // 60}:{sec % 60:02d}"
+
+
+async def safe_edit(msg: Message, text: str):
+    """Xabarni tahrirlashda xatolik chiqsa (masalan, o'chirilgan bo'lsa) bot qulamasin."""
+    try:
+        await msg.edit_text(text)
+    except Exception:
+        logging.warning("edit_text failed", exc_info=True)
+
+
+async def safe_delete(msg: Message):
+    try:
+        await msg.delete()
+    except Exception:
+        pass
+
+
+def explain_error(exc: Exception) -> str:
+    text = str(exc).lower()
+    if "sign in to confirm" in text or "not a bot" in text:
+        return "YouTube so'rovni blokladi. Keyinroq urinib ko'ring."
+    if "private" in text or "unavailable" in text or "not available" in text:
+        return "Bu video mavjud emas yoki yopiq."
+    if "ffmpeg" in text or "ffprobe" in text:
+        return "Serverda ffmpeg bilan muammo bor."
+    if "age" in text and "restrict" in text:
+        return "Bu video yosh cheklovi tufayli yuklanmaydi."
+    return "Xatolik yuz berdi. Keyinroq urinib ko'ring."
+
+
+async def send_track(message: Message, video_id: str) -> bool:
+    """Qo'shiqni MP3 qilib to'g'ridan-to'g'ri chatga yuboradi."""
+    status = await message.answer("⏳ Yuklab olinmoqda...")
+    tmp = tempfile.mkdtemp()
+    try:
+        async with DOWNLOAD_SEM:  # global parallel yuklashlar cheklovi
+            res = await asyncio.to_thread(download_sync, video_id, tmp)
+        if not res:
+            await safe_edit(status, "Yuklab bo'lmadi (juda uzun yoki mavjud emas).")
+            return False
+        file, title, uploader, duration = res
+        if file.stat().st_size > TG_UPLOAD_LIMIT:
+            await safe_edit(status, "Fayl Telegram limitidan (50 MB) katta, yuborib bo'lmaydi.")
+            return False
+        await message.answer_audio(
+            FSInputFile(file),
+            title=title,
+            performer=uploader,
+            duration=duration,
+        )
+        await safe_delete(status)
+        return True
+    except Exception as e:
+        logging.exception("download error")
+        await safe_edit(status, explain_error(e))
+        return False
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+async def send_results(message: Message, query: str):
+    status = await message.answer("🔎 Qidirilmoqda...")
+    try:
+        results = await asyncio.to_thread(search_sync, query)
+    except Exception as e:
+        logging.exception("search error")
+        await safe_edit(status, explain_error(e))
+        return
+    await safe_delete(status)
+    if not results:
+        await message.answer("Hech narsa topilmadi 😕")
+        return
+
+    # 1-natijani darhol MP3 qilib yuboramiz
+    await send_track(message, results[0]["id"])
+
+    # Boshqa variantlar tugmalar bilan
+    others = results[1:6]
+    if others:
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text=f"{r['title'][:50]} ({fmt_duration(r['duration'])})",
+                        callback_data=f"dl:{r['id']}",
+                    )
+                ]
+                for r in others
+            ]
+        )
+        await message.answer("Boshqa variant kerak bo'lsa, tanlang 👇", reply_markup=kb)
+
+
+async def to_wav(src: str, dst: str) -> bool:
+    """Shazam uchun ishonchli format: 44.1 kHz mono WAV, birinchi 20 soniya."""
+    proc = await asyncio.create_subprocess_exec(
+        "ffmpeg", "-y", "-i", src, "-t", "20", "-ar", "44100", "-ac", "1", dst,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    await proc.wait()
+    return proc.returncode == 0 and os.path.exists(dst)
+
+
+# ---------- Handlerlar ----------
+@dp.message(CommandStart())
+async def start(message: Message):
+    await message.answer(
+        "Salom! 🎵\n\n"
+        "• Qo'shiq yoki ijrochi nomini yozing\n"
+        "• Yoki ovozli xabar / audio / video yuboring — qo'shiqni aniqlayman"
+    )
+
+
+@dp.message(F.voice | F.audio | F.video | F.video_note)
+async def recognize(message: Message):
+    user_id = message.from_user.id
+    if user_id in ACTIVE_USERS:
+        await message.answer("Avvalgi so'rovingiz hali bajarilmoqda, biroz kuting ⏳")
+        return
+
+    media = message.voice or message.audio or message.video or message.video_note
+    if media.file_size and media.file_size > TG_DOWNLOAD_LIMIT:
+        await message.answer("Fayl juda katta (20 MB dan oshmasin). Qisqaroq parcha yuboring.")
+        return
+
+    ACTIVE_USERS.add(user_id)
+    status = await message.answer("🎧 Tinglayapman...")
+    tmp = tempfile.mkdtemp()
+    try:
+        src = os.path.join(tmp, "input")
+        wav = os.path.join(tmp, "input.wav")
+        await bot.download(media.file_id, destination=src)
+
+        if not await to_wav(src, wav):
+            await safe_edit(status, "Faylni o'qib bo'lmadi. Boshqa formatda yuborib ko'ring.")
+            return
+
+        out = await Shazam().recognize(wav)
+        track = out.get("track")
+        if not track:
+            await safe_edit(status, "Qo'shiq aniqlanmadi 😕 Uzunroq (10-15 soniya) parcha yuboring.")
+            return
+        query = f"{track['subtitle']} - {track['title']}"
+        await safe_edit(status, f"✅ Topildi: {query}")
+        await send_results(message, query)
+    except Exception:
+        logging.exception("recognize error")
+        await safe_edit(status, "Qo'shiqni aniqlashda xatolik yuz berdi.")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+        ACTIVE_USERS.discard(user_id)
+
+
+@dp.message(F.text & ~F.text.startswith("/"))
+async def search(message: Message):
+    query = message.text.strip()
+    if len(query) < 2:
+        await message.answer("Qo'shiq yoki ijrochi nomini to'liqroq yozing ✍️")
+        return
+
+    user_id = message.from_user.id
+    if user_id in ACTIVE_USERS:
+        await message.answer("Avvalgi so'rovingiz hali bajarilmoqda, biroz kuting ⏳")
+        return
+
+    ACTIVE_USERS.add(user_id)
+    try:
+        await send_results(message, query)
+    finally:
+        ACTIVE_USERS.discard(user_id)
+
+
+@dp.callback_query(F.data.startswith("dl:"))
+async def download(call: CallbackQuery):
+    user_id = call.from_user.id
+    if user_id in ACTIVE_USERS:
+        await call.answer("Avvalgi so'rov tugashini kuting ⏳", show_alert=True)
+        return
+
+    video_id = call.data.split(":", 1)[1]
+    await call.answer("Yuklanmoqda...")
+    ACTIVE_USERS.add(user_id)
+    try:
+        await send_track(call.message, video_id)
+    finally:
+        ACTIVE_USERS.discard(user_id)
+
+
+async def main():
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
